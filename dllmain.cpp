@@ -150,6 +150,193 @@ template<class T>static bool RV(DWORD a,T&v){return SafeRead(a,&v,sizeof(T));}
 static bool Rd(DWORD a,void*b,SIZE_T s){return SafeRead(a,b,s);}
 static bool RP(DWORD a,DWORD&o){o=0;if(!RV(a,o))return false;return Valid(o);}
 static bool g_antiACHooked=false;
+
+// ============================================================
+// RakNet / SAMP networking (usado pelo Super Punch via RPC sync)
+// Enderecos fornecidos:
+//   RakClient (pRakClientInterface global) = samp.dll + 0x04B9AFB8
+//   RakClientInterface::Send             = vtable[5]  -> samp.dll + 0x03C088E0
+//   RakClientInterface::Receive          = vtable[6]  -> samp.dll + 0x03C0A550
+//   RakClientInterface::RPC(BitStream*)  = vtable[23] -> samp.dll + 0x03C06C30
+// ============================================================
+enum PacketPriority { SYSTEM_PRIORITY=0, HIGH_PRIORITY=1, MEDIUM_PRIORITY=2, LOW_PRIORITY=3, NUMBER_OF_PRIORITIES };
+enum PacketReliability { UNRELIABLE=6, UNRELIABLE_SEQUENCED, RELIABLE, RELIABLE_ORDERED, RELIABLE_SEQUENCED };
+static const int RPC_GiveTakeDamage = 115;
+static const DWORD SAMP_RAKCLIENT_PTR_OFS = 0x04B9AFB8;
+static const DWORD SAMP_SEND_VTIDX       = 5;
+static const DWORD SAMP_RECV_VTIDX       = 6;
+static const DWORD SAMP_RPC_VTIDX        = 23;
+
+// BitStream "falso" mas com layout compativel com o RakNet::BitStream usado
+// pelo SA-MP 0.3.7 (ordem e tamanho dos campos batem com o RakNet 3.x:
+//   numberOfBitsUsed, numberOfBitsAllocated, readOffset, copyData, data
+// Depois vem stackData[BITSTREAM_STACK_ALLOCATION_SIZE] que nao usamos
+// porque alocamos um buffer grande no heap e setamos copyData = true com
+// bitsAlocados > 256 para o destrutor nao freear stackData e sim nosso buffer.
+// Importante: todos os writes sao feitos alinhados em byte para nunca
+// desalinhar o bitstream (o RakNet's Write(char*, len) nesse caso so faz memcpy).
+struct RakBitStream {
+    unsigned int   numberOfBitsUsed;
+    unsigned int   numberOfBitsAllocated;
+    unsigned int   readOffset;
+    bool           copyData;
+    unsigned char* data;
+
+    RakBitStream() : numberOfBitsUsed(0), numberOfBitsAllocated(0), readOffset(0), copyData(true), data(nullptr) {
+        alloc(256);
+    }
+    ~RakBitStream() {
+        if(data) { free(data); data = nullptr; }
+        numberOfBitsUsed = numberOfBitsAllocated = readOffset = 0;
+        copyData = false;
+    }
+    void alloc(unsigned int bytes){
+        unsigned int needBits = bytes*8;
+        if(needBits > numberOfBitsAllocated){
+            unsigned char* nd = (unsigned char*)realloc(data, bytes);
+            if(nd){
+                data = nd;
+                memset(data+(numberOfBitsAllocated>>3), 0, bytes-(numberOfBitsAllocated>>3));
+                numberOfBitsAllocated = needBits;
+            }
+        }
+    }
+    unsigned int GetNumberOfBytesUsed() const { return (numberOfBitsUsed+7)>>3; }
+    unsigned int GetNumberOfBitsUsed()  const { return numberOfBitsUsed; }
+    const char* GetData() const { return (const char*)data; }
+    unsigned int GetReadOffset() const { return readOffset; }
+    void SetReadOffset(unsigned int off) { readOffset = off; }
+
+    // Escrita sempre alinhada em byte para nunca precisar de WriteBits.
+    void WriteBytesAligned(const void* src, unsigned int n){
+        if(n == 0 || !src) return;
+        if(numberOfBitsUsed & 7) return; // exige alinhamento
+        alloc(GetNumberOfBytesUsed() + n + 16);
+        memcpy(data + (numberOfBitsUsed>>3), src, n);
+        numberOfBitsUsed += n*8;
+    }
+    void WriteBitsMSB(const unsigned char* src, unsigned int bits){
+        if(!src || bits == 0) return;
+        alloc(GetNumberOfBytesUsed() + (bits/8) + 8);
+        for(unsigned int i=0;i<bits;++i){
+            unsigned char b = (unsigned char)((src[i>>3] >> (7-(i&7))) & 1u);
+            WriteBit(b);
+        }
+    }
+    void WriteBool(bool v){
+        WriteBit(v ? 1 : 0);
+    }
+    void WriteBit(unsigned char b){
+        alloc(GetNumberOfBytesUsed() + 2);
+        unsigned int byteIdx = numberOfBitsUsed >> 3;
+        unsigned char bitIdx = (unsigned char)(7 - (numberOfBitsUsed & 7));
+        if(b) data[byteIdx] |=  (unsigned char)(1u << bitIdx);
+        else  data[byteIdx] &= (unsigned char)~(1u << bitIdx);
+        numberOfBitsUsed++;
+    }
+    void AlignWriteToByteBoundary(){
+        while(numberOfBitsUsed & 7) WriteBit(0);
+    }
+    template<class T> void WriteValue(const T& v){
+        static_assert(sizeof(T)==1||sizeof(T)==2||sizeof(T)==4, "Use tamanho 1/2/4");
+        // Escreve como big-endian bit a bit (MSB first), igual ao RakNet.
+        union{ T val; unsigned char b[4]; } u;
+        u.val = v;
+        for(int i=(int)sizeof(T)-1;i>=0;--i) WriteBitsMSB(&u.b[i], 8);
+    }
+    void WriteU8(unsigned char v){ unsigned char x=v; WriteBitsMSB(&x,8); }
+    void WriteU16(unsigned short v){ WriteValue<unsigned short>(v); }
+    void WriteI32(int v){ WriteValue<int>(v); }
+    void WriteF32(float v){ WriteValue<float>(v); }
+};
+
+// RakClientInterface::RPC(BitStream*) - thiscall.
+// Assinatura: bool RPC(int* uniqueID, BitStream* bs, int prio, int rel, char ord, bool shiftTs);
+typedef bool(__thiscall* tRakRPC)(void* iface, int* rpcId, void* bitStream, int prio, int rel, char ordCh, bool shiftTs);
+static void* GetRakClient(){
+    if(!g_sampBase) return nullptr;
+    void* rc = nullptr;
+    DWORD ptrAddr = g_sampBase + SAMP_RAKCLIENT_PTR_OFS;
+    if(!RP(ptrAddr, *(DWORD*)&rc)) return nullptr;
+    return rc;
+}
+static void CallRakRPC(int rpcId, RakBitStream& bs){
+    // Envelopa o payload e envia direto por Send(BitStream*). Esse método existe
+    // no RakClientInterface (vtable) e o endereco 0x03C088E0 bate exatamente com
+    // o Send(BitStream*,prio,rel,ord) que SAMP usa em todo lugar.
+    //
+    // Montamos o envelope no formato do RakPeer::RPC(int*,...) que o SA-MP usa
+    // (RakNet 2.x com IDs inteiros <= 256):
+    //   [1] byte         ID_RPC = 22
+    //   [1] byte         rpcId   (1..255)
+    //   [comp] uint32    bitLength (WriteCompressed)
+    //   [N*8] bits       dados do payload
+    //
+    // WriteCompressed(unsigned int) no RakNet 2/3:
+    //   - se valor == 0: Write(false)
+    //   - senao: Write(true); escreve 2 bits com o numero de bytes necessarios
+    //           (0..4 => 1..4 bytes); depois escreve o uint como N bytes em
+    //           little-endian.
+    // Para 120 bits (payload do RPC 115 = 15 bytes = 120 bits < 256 => 1 byte),
+    // comprimido fica: 1 (true) + 2 bits indicando 1 byte => 3 bits, depois 1 byte
+    // de valor. Total: 11 bits (2 bytes no fio porque fica desalinhado...).
+    //
+    // Em vez de implementar WriteCompressed (que usa WriteBits desalinhado) e
+    // WriteBits com rightAlignedBits=false, vamos escrever o envelope usando
+    // WriteBit a WriteBit para ficar correto e independente de alinhamento,
+    // copiando os bits do payload bruto (byte-aligned) sem mudar o significado.
+    void* rc = GetRakClient();
+    if(!rc) return;
+    typedef bool(__thiscall* tSendBS)(void* iface, void* bitStream, int prio, int rel, char ord);
+    static tSendBS fnSendBS = nullptr;
+    static bool resolved = false;
+    if(!resolved){
+        if(g_sampBase) fnSendBS = (tSendBS)(g_sampBase + 0x03C088E0);
+        resolved = true;
+    }
+    if(!fnSendBS) return;
+
+    RakBitStream out;
+    out.WriteU8(22);                   // ID_RPC
+    out.WriteU8((unsigned char)rpcId); // rpcId (0..255)
+    // WriteCompressed(bitLength)
+    unsigned int bits = bs.GetNumberOfBitsUsed();
+    if(bits == 0){
+        out.WriteBit(0);
+    } else {
+        out.WriteBit(1);
+        unsigned char byteCount;
+        if(bits <= 0xFFu) byteCount = 1;
+        else if(bits <= 0xFFFFu) byteCount = 2;
+        else if(bits <= 0xFFFFFFu) byteCount = 3;
+        else byteCount = 4;
+        unsigned char bc = (unsigned char)(byteCount-1);
+        out.WriteBit((bc>>1)&1);
+        out.WriteBit((bc>>0)&1);
+        for(unsigned char b=0;b<byteCount;++b){
+            unsigned char v = (unsigned char)((bits >> (8*b)) & 0xFFu);
+            out.WriteU8(v);
+        }
+    }
+    // Copia payload bit a bit
+    if(bits > 0) out.WriteBitsMSB((const unsigned char*)bs.GetData(), bits);
+
+    fnSendBS(rc, &out, HIGH_PRIORITY, RELIABLE, 0);
+}
+
+static int GetLocalPlayerId(){
+    // Versao R1 do menu: usa offsets ja presentes no codigo para info/pools/pool de players.
+    if(!g_sampBase) return -1;
+    DWORD info=0, pools=0, pp=0;
+    DWORD sOff1=0x21A0F8, sOff2=0x3CD, sOff3=0x18;
+    if(!RP(g_sampBase+sOff1, info) || !RP(info+sOff2, pools) || !RP(pools+sOff3, pp)) return -1;
+    unsigned short lid = 0xFFFF;
+    // PlayerPool da R1 guarda o ID local no offset 0x4 a partir da base do pool (SAMP-UDF confirma).
+    if(!RV(pp + 0x4, lid)) return -1;
+    if(lid >= 1000) return -1;
+    return (int)lid;
+}
+
 static const char* g_weaponNames[]={"Fist","Brass Knuckles","Golf Club","Nightstick","Knife","Baseball Bat","Shovel","Pool Cue","Katana","Chainsaw","Purple Dildo","Dildo","Vibrator","Silver Vibrator","Flowers","Cane","Grenade","Tear Gas","Molotov","_","_","_","Colt 45","Silenced","Desert Eagle","Shotgun","Sawnoff","Combat Shotgun","Micro SMG","MP5","AK-47","M4","Tec-9","Country Rifle","Sniper Rifle","RPG","HS Rocket","Flamethrower","Minigun","Satchel Charge","Detonator","Spraycan","Fire Extinguisher","Camera","Night Vision","Thermal","Parachute"};
 static const char* GetWeaponName(int id){return(id>=0&&id<47)?g_weaponNames[id]:"Unknown";}
 static const char* g_vehicleNames[]={"Landstalker","Bravura","Buffalo","Linerunner","Perennial","Sentinel","Dumper","Firetruck","Trashmaster","Stretch","Manana","Infernus","Voodoo","Pony","Mule","Cheetah","Ambulance","Leviathan","Moonbeam","Esperanto","Taxi","Washington","Bobcat","Mr Whoopee","BF Injection","Hunter","Premier","Enforcer","Securicar","Banshee","Predator","Bus","Rhino","Barracks","Hotknife","Trailer 1","Previon","Coach","Cabbie","Stallion","Rumpo","RC Bandit","Romero","Packer","Monster","Admiral","Squalo","Seasparrow","Pizzaboy","Tram","Trailer 2","Turismo","Speeder","Reefer","Tropic","Flatbed","Yankee","Caddy","Solair","Berkley","Skimmer","PCJ-600","Faggio","Freeway","RC Baron","RC Raider","Glendale","Oceanic","Sanchez","Sparrow","Patriot","Quad","Coastguard","Dinghy","Hermes","Sabre","Rustler","ZR-350","Walton","Regina","Comet","BMX","Burrito","Camper","Marquis","Baggage","Dozer","Maverick","News Chopper","Rancher","FBI Rancher","Virgo","Greenwood","Jetmax","Hotring Racer","Sandking","Blista Compact","Police Maverick","Boxville","Benson","Mesa","RC Goblin","Hotring Racer A","Hotring Racer B","Bloodring Banger","Rancher","Super GT","Elegant","Journey","Bike","Mountain Bike","Beagle","Cropduster","Stuntplane","Tanker","Roadtrain","Nebula","Majestic","Buccaneer","Shamal","Hydra","FCR-900","NRG-500","HPV1000","Cement Truck","Tow Truck","Fortune","Cadrona","FBI Truck","Willard","Forklift","Tractor","Combine","Feltzer","Remington","Slamvan","Blade","Freight","Streak","Vortex","Vincent","Bullet","Clover","Sadler","Firetruck LA","Hustler","Intruder","Primo","Cargobob","Tampa","Sunrise","Merit","Utility","Nevada","Yosemite","Windsor","Monster A","Monster B","Uranus","Jester","Sultan","Stratum","Elegy","Raindance","RC Tiger","Flash","Tahoma","Savanna","Bandito","Freight Flat","Streak Carriage","Kart","Mower","Duneride","Sweeper","Broadway","Tornado","AT-400","DFT-30","Huntley","Stafford","BF-400","Newsvan","Tug","Trailer 3","Emperor","Wayfarer","Euros","Hotdog","Club","Freight Carriage","Trailer 3","Andromada","Dodo","RC Cam","Launch","Police Car LS","Police Car SF","Police Car LV","Police Ranger","Picador","S.W.A.T.","Alpha","Phoenix","Glendale","Sadler","Luggage Trailer A","Luggage Trailer B","Stair Trailer","Boxville","Farm Plow","Utility Trailer"};
@@ -1310,29 +1497,49 @@ void InitImGui(LPDIRECT3DDEVICE9 pDevice){
 void UpdateScreenSize(){if(!gWindow)return;RECT rc;if(GetClientRect(gWindow,&rc)){g_screenW=rc.right;g_screenH=rc.bottom;}}
 
 static void ProcessSuperPunch() {
-    // super punch
+    // Super Punch REAL via RPC sync (RPC_GiveTakeDamage = 115).
+    // Em vez de setar HP/velocidade na memoria local (que era apenas visual e o
+    // servidor sobrescrevia no proximo sync), envia ao servidor o RPC de dano para
+    // que o hit seja validado e sincronizado de verdade para todos os players.
     if (!superpunch_on) return;
+
+    static DWORD lastHitTime[1004] = {0};
+
     for (const auto& pl : g_players) {
         if (pl.isLocal || !pl.valid || pl.hp <= 0) continue;
-        if (pl.dist < 3.0f && Valid(pl.ped)) {
-            for (const auto& sp : g_sampList) {
-                if (sp.id == pl.id && Valid(sp.pData)) {
-                    if (!IsBadWritePtr((void*)(sp.pData + 0x1BC), 4))
-                        *(float*)(sp.pData + 0x1BC) = 0.0f;
-                    if (!IsBadWritePtr((void*)(sp.pData + 0x1B8), 4))
-                        *(float*)(sp.pData + 0x1B8) = 0.0f;
-                    break;
-                }
-            }
-            if (!IsBadWritePtr((void*)(pl.ped + 0x540), 4))
-                *(float*)(pl.ped + 0x540) = -9999.0f;
-            if (!IsBadWritePtr((void*)(pl.ped + 0x548), 4))
-                *(float*)(pl.ped + 0x548) = 0.0f;
-            if (!IsBadWritePtr((void*)(pl.ped + 0x44), 12)) {
-                float* vel = (float*)(pl.ped + 0x44);
-                vel[0] = 0; vel[1] = 0; vel[2] = -15.0f;
-            }
-        }
+        if (pl.id < 0 || pl.id >= 1004) continue;
+        if (pl.dist >= 3.0f || !Valid(pl.ped)) continue;
+
+        DWORD now = GetTickCount();
+        // Rate-limit por alvo para evitar flood de RPC (dano a cada ~180ms).
+        if (now - lastHitTime[pl.id] < 180) continue;
+
+        bool punching = false;
+        // Checa se estamos em anim de ataque corpo-a-corpo (fightingKeys / moveFlag).
+        // Usamos o estado de aim/ataque via keys do GTA para nao enviar RPC quando
+        // o player nem estiver atacando.
+        SHORT lmb = GetAsyncKeyState(VK_LBUTTON);
+        if((lmb & 0x8000)!=0) punching = true;
+        if(!punching) continue;
+
+        lastHitTime[pl.id] = now;
+
+        RakBitStream bs;
+        // Formato do RPC 115 (GiveTakeDamage) no SA-MP 0.3.7, confirmado por
+        // captura do proprio cliente (15 bytes = 120 bits):
+        //   bool  (1 bit)   isTakeDamage = false (GIVE damage)
+        //   padding (7 bits) pra alinhar em byte
+        //   uint16 (16 bits) damagedPlayerId
+        //   float  (32 bits) damageAmount
+        //   int32  (32 bits) weaponId  (0 = fist / unarmed)
+        //   int32  (32 bits) bodyPart  (3 = torso/chest)
+        bs.WriteBool(false);
+        bs.AlignWriteToByteBoundary();
+        bs.WriteU16((unsigned short)pl.id);
+        bs.WriteF32(20.0f);            // dano por soco
+        bs.WriteI32(0);                // WEAPON_FIST
+        bs.WriteI32(3);                // bodypart torso
+        CallRakRPC(RPC_GiveTakeDamage, bs);
     }
 }
 
@@ -1553,7 +1760,7 @@ void RenderMenu(LPDIRECT3DDEVICE9 pDevice){
                 ImGui::PopStyleVar();
             }
 			
-			ToggleCard("Super Punch",&superpunch_on);
+			ToggleCard("Super Punch (RPC Sync)",&superpunch_on);
             ImGui::Columns(1);
         }break;
         case 4:{
