@@ -121,6 +121,7 @@ static bool fly_on=false,wait_fly_key=false;
 static int fly_key=0;
 static float fly_speed=2.0f;
 static bool godmode_on=false;
+static bool superpunch_on=false;
 static bool tpkill_active=false;
 static Vec3 tpkill_myPos={0,0,0};
 static DWORD tpkill_timer=0;
@@ -585,7 +586,7 @@ static void LoadConfig() {
         LOAD_COLOR(proaim_fov_col);
         LOAD_BOOL(flycar_on); LOAD_INT(flycar_key); LOAD_FLOAT(flycar_speed);
         LOAD_BOOL(fly_on); LOAD_INT(fly_key); LOAD_FLOAT(fly_speed);
-        LOAD_BOOL(godmode_on); LOAD_BOOL(tp_way_on);
+        LOAD_BOOL(godmode_on); LOAD_BOOL(superpunch_on); LOAD_BOOL(tp_way_on);
         LOAD_BOOL(slingshot_on); LOAD_INT(slingshot_key); LOAD_FLOAT(slingshot_speed);
         if (key == "friends") {
             g_friends.clear();
@@ -634,7 +635,7 @@ static void SaveConfig() {
     SAVE_COLOR(proaim_fov_col);
     SAVE_BOOL(flycar_on); SAVE_INT(flycar_key); SAVE_FLOAT(flycar_speed);
     SAVE_BOOL(fly_on); SAVE_INT(fly_key); SAVE_FLOAT(fly_speed);
-    SAVE_BOOL(godmode_on); SAVE_BOOL(tp_way_on);
+    SAVE_BOOL(godmode_on); SAVE_BOOL(superpunch_on); SAVE_BOOL(tp_way_on);
     SAVE_BOOL(slingshot_on); SAVE_INT(slingshot_key); SAVE_FLOAT(slingshot_speed);
     f << "friends=";
     for (size_t i = 0; i < g_friends.size(); i++) {
@@ -1594,11 +1595,8 @@ void RenderMenu(LPDIRECT3DDEVICE9 pDevice){
                 ImGui::PopStyleVar();
             }
 			
-			ToggleCard("Super Punch",&Spunch)
+			ToggleCard("Super Punch",&superpunch_on);
             ImGui::Columns(1);
-			if (Spunch){
-				ProcessSuperPunch();
-			}
         }break;
         case 4:{
             ImDrawList*dl2=ImGui::GetWindowDrawList();ImVec2 rp0=ImGui::GetCursorScreenPos();float rW=ImGui::GetContentRegionAvail().x;
