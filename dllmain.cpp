@@ -1310,69 +1310,27 @@ void InitImGui(LPDIRECT3DDEVICE9 pDevice){
 void UpdateScreenSize(){if(!gWindow)return;RECT rc;if(GetClientRect(gWindow,&rc)){g_screenW=rc.right;g_screenH=rc.bottom;}}
 
 static void ProcessSuperPunch() {
+    // super punch
     if (!superpunch_on) return;
-    static DWORD lastSP = 0;
-    DWORD now = GetTickCount();
-    if (now - lastSP < 40) return;
-    lastSP = now;
-
-    // Hit kill - mata jogadores muito proximos (colision / bater)
     for (const auto& pl : g_players) {
         if (pl.isLocal || !pl.valid || pl.hp <= 0) continue;
         if (pl.dist < 3.0f && Valid(pl.ped)) {
-            // Matar pelo Samp pData
             for (const auto& sp : g_sampList) {
                 if (sp.id == pl.id && Valid(sp.pData)) {
                     if (!IsBadWritePtr((void*)(sp.pData + 0x1BC), 4))
                         *(float*)(sp.pData + 0x1BC) = 0.0f;
+                    if (!IsBadWritePtr((void*)(sp.pData + 0x1B8), 4))
+                        *(float*)(sp.pData + 0x1B8) = 0.0f;
                     break;
                 }
             }
-            // Matar pelo ped (HP e armor)
             if (!IsBadWritePtr((void*)(pl.ped + 0x540), 4))
-                *(float*)(pl.ped + 0x540) = 0.0f;
+                *(float*)(pl.ped + 0x540) = -9999.0f;
             if (!IsBadWritePtr((void*)(pl.ped + 0x548), 4))
                 *(float*)(pl.ped + 0x548) = 0.0f;
-        }
-    }
-
-    // Arremessar veiculos proximos (ao bater neles)
-    for (const auto& nv : g_nearbyVehicles) {
-        if (nv.dist < 6.0f && Valid(nv.ptr)) {
-            Vec3 vPos = nv.pos;
-            float dx = vPos.x - g_myPos.x;
-            float dy = vPos.y - g_myPos.y;
-            float len = sqrtf(dx*dx + dy*dy);
-            if (len < 0.1f) { dx = 1.0f; dy = 0.0f; len = 1.0f; }
-            float dirX = dx / len;
-            float dirY = dy / len;
-
-            float spd = 200.0f / 180.0f;
-            Vec3 newVel = { dirX * spd, dirY * spd, 25.0f / 180.0f };
-
-            DWORD ptr = nv.ptr;
-            DWORD vm = 0;
-
-            // Aplicar velocidade alta para arremessar longe
-            if (RP(ptr + 0x14, vm) && Valid(vm)) {
-                if (!IsBadWritePtr((void*)(ptr + 0x44), 12))
-                    memcpy((void*)(ptr + 0x44), &newVel, 12);
-                // Zerar rotacao angular
-                if (!IsBadWritePtr((void*)(ptr + 0x4C), 12)) {
-                    float zAng[3] = {0,0,0};
-                    memcpy((void*)(ptr + 0x4C), zAng, 12);
-                }
-            }
-
-            // Mover o veiculo um pouco para frente na direcao (arremesso)
-            Vec3 newPos = {
-                vPos.x + dirX * 12.0f,
-                vPos.y + dirY * 12.0f,
-                vPos.z + 2.0f
-            };
-            if (RP(ptr + 0x14, vm) && Valid(vm)) {
-                if (!IsBadWritePtr((void*)(vm + 0x30), 12))
-                    memcpy((void*)(vm + 0x30), &newPos, 12);
+            if (!IsBadWritePtr((void*)(pl.ped + 0x44), 12)) {
+                float* vel = (float*)(pl.ped + 0x44);
+                vel[0] = 0; vel[1] = 0; vel[2] = -15.0f;
             }
         }
     }
