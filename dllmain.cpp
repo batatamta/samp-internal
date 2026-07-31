@@ -106,6 +106,7 @@ static int magnet_key=0,magnet_target=0,magnet_priority=0;
 static float magnet_fov=250.0f,magnet_distance=3.0f,magnet_offsetX=0.4f;
 static float magnet_fov_col[4]={1,0.3f,0.3f,1};
 static int magnet_lockedId=-1;
+static bool magnet_pull_all=false;
 static bool proaim_on=false,proaim_show_fov=false,wait_proaim_key=false;
 static int proaim_key=0,proaim_target=0,proaim_priority=0;
 static int proaim_fov=250;
@@ -121,7 +122,8 @@ static bool fly_on=false,wait_fly_key=false;
 static int fly_key=0;
 static float fly_speed=2.0f;
 static bool godmode_on=false;
-static bool superpunch_on=false;
+static bool noclip_on=false;
+static float noclip_speed=5.0f;
 static bool tpkill_active=false;
 static Vec3 tpkill_myPos={0,0,0};
 static DWORD tpkill_timer=0;
@@ -141,6 +143,8 @@ static int slingshot_phase = 0;
 static Vec3 slingshot_forward = {0, 0, 0};
 static float slingshot_startYaw = 0.0f;
 static bool slingshot_isBike = false;
+static bool insta_brake_on=false,wait_insta_brake_key=false;
+static int insta_brake_key=0;
 static inline bool Valid(DWORD p){return p>=0x400000&&p<0x80000000u;}
 static inline bool IsFiniteF(float v){return isfinite(v)!=0;}
 static inline bool IsValidPos(const Vec3&v){return IsFiniteF(v.x)&&IsFiniteF(v.y)&&IsFiniteF(v.z)&&fabsf(v.x)<30000&&fabsf(v.y)<30000&&fabsf(v.z)<30000;}
@@ -150,192 +154,6 @@ template<class T>static bool RV(DWORD a,T&v){return SafeRead(a,&v,sizeof(T));}
 static bool Rd(DWORD a,void*b,SIZE_T s){return SafeRead(a,b,s);}
 static bool RP(DWORD a,DWORD&o){o=0;if(!RV(a,o))return false;return Valid(o);}
 static bool g_antiACHooked=false;
-
-// ============================================================
-// RakNet / SAMP networking (usado pelo Super Punch via RPC sync)
-// Enderecos fornecidos:
-//   RakClient (pRakClientInterface global) = samp.dll + 0x04B9AFB8
-//   RakClientInterface::Send             = vtable[5]  -> samp.dll + 0x03C088E0
-//   RakClientInterface::Receive          = vtable[6]  -> samp.dll + 0x03C0A550
-//   RakClientInterface::RPC(BitStream*)  = vtable[23] -> samp.dll + 0x03C06C30
-// ============================================================
-enum PacketPriority { SYSTEM_PRIORITY=0, HIGH_PRIORITY=1, MEDIUM_PRIORITY=2, LOW_PRIORITY=3, NUMBER_OF_PRIORITIES };
-enum PacketReliability { UNRELIABLE=6, UNRELIABLE_SEQUENCED, RELIABLE, RELIABLE_ORDERED, RELIABLE_SEQUENCED };
-static const int RPC_GiveTakeDamage = 115;
-static const DWORD SAMP_RAKCLIENT_PTR_OFS = 0x04B9AFB8;
-static const DWORD SAMP_SEND_VTIDX       = 5;
-static const DWORD SAMP_RECV_VTIDX       = 6;
-static const DWORD SAMP_RPC_VTIDX        = 23;
-
-// BitStream "falso" mas com layout compativel com o RakNet::BitStream usado
-// pelo SA-MP 0.3.7 (ordem e tamanho dos campos batem com o RakNet 3.x:
-//   numberOfBitsUsed, numberOfBitsAllocated, readOffset, copyData, data
-// Depois vem stackData[BITSTREAM_STACK_ALLOCATION_SIZE] que nao usamos
-// porque alocamos um buffer grande no heap e setamos copyData = true com
-// bitsAlocados > 256 para o destrutor nao freear stackData e sim nosso buffer.
-// Importante: todos os writes sao feitos alinhados em byte para nunca
-// desalinhar o bitstream (o RakNet's Write(char*, len) nesse caso so faz memcpy).
-struct RakBitStream {
-    unsigned int   numberOfBitsUsed;
-    unsigned int   numberOfBitsAllocated;
-    unsigned int   readOffset;
-    bool           copyData;
-    unsigned char* data;
-
-    RakBitStream() : numberOfBitsUsed(0), numberOfBitsAllocated(0), readOffset(0), copyData(true), data(nullptr) {
-        alloc(256);
-    }
-    ~RakBitStream() {
-        if(data) { free(data); data = nullptr; }
-        numberOfBitsUsed = numberOfBitsAllocated = readOffset = 0;
-        copyData = false;
-    }
-    void alloc(unsigned int bytes){
-        unsigned int needBits = bytes*8;
-        if(needBits > numberOfBitsAllocated){
-            unsigned char* nd = (unsigned char*)realloc(data, bytes);
-            if(nd){
-                data = nd;
-                memset(data+(numberOfBitsAllocated>>3), 0, bytes-(numberOfBitsAllocated>>3));
-                numberOfBitsAllocated = needBits;
-            }
-        }
-    }
-    unsigned int GetNumberOfBytesUsed() const { return (numberOfBitsUsed+7)>>3; }
-    unsigned int GetNumberOfBitsUsed()  const { return numberOfBitsUsed; }
-    const char* GetData() const { return (const char*)data; }
-    unsigned int GetReadOffset() const { return readOffset; }
-    void SetReadOffset(unsigned int off) { readOffset = off; }
-
-    // Escrita sempre alinhada em byte para nunca precisar de WriteBits.
-    void WriteBytesAligned(const void* src, unsigned int n){
-        if(n == 0 || !src) return;
-        if(numberOfBitsUsed & 7) return; // exige alinhamento
-        alloc(GetNumberOfBytesUsed() + n + 16);
-        memcpy(data + (numberOfBitsUsed>>3), src, n);
-        numberOfBitsUsed += n*8;
-    }
-    void WriteBitsMSB(const unsigned char* src, unsigned int bits){
-        if(!src || bits == 0) return;
-        alloc(GetNumberOfBytesUsed() + (bits/8) + 8);
-        for(unsigned int i=0;i<bits;++i){
-            unsigned char b = (unsigned char)((src[i>>3] >> (7-(i&7))) & 1u);
-            WriteBit(b);
-        }
-    }
-    void WriteBool(bool v){
-        WriteBit(v ? 1 : 0);
-    }
-    void WriteBit(unsigned char b){
-        alloc(GetNumberOfBytesUsed() + 2);
-        unsigned int byteIdx = numberOfBitsUsed >> 3;
-        unsigned char bitIdx = (unsigned char)(7 - (numberOfBitsUsed & 7));
-        if(b) data[byteIdx] |=  (unsigned char)(1u << bitIdx);
-        else  data[byteIdx] &= (unsigned char)~(1u << bitIdx);
-        numberOfBitsUsed++;
-    }
-    void AlignWriteToByteBoundary(){
-        while(numberOfBitsUsed & 7) WriteBit(0);
-    }
-    template<class T> void WriteValue(const T& v){
-        static_assert(sizeof(T)==1||sizeof(T)==2||sizeof(T)==4, "Use tamanho 1/2/4");
-        // Escreve como big-endian bit a bit (MSB first), igual ao RakNet.
-        union{ T val; unsigned char b[4]; } u;
-        u.val = v;
-        for(int i=(int)sizeof(T)-1;i>=0;--i) WriteBitsMSB(&u.b[i], 8);
-    }
-    void WriteU8(unsigned char v){ unsigned char x=v; WriteBitsMSB(&x,8); }
-    void WriteU16(unsigned short v){ WriteValue<unsigned short>(v); }
-    void WriteI32(int v){ WriteValue<int>(v); }
-    void WriteF32(float v){ WriteValue<float>(v); }
-};
-
-// RakClientInterface::RPC(BitStream*) - thiscall.
-// Assinatura: bool RPC(int* uniqueID, BitStream* bs, int prio, int rel, char ord, bool shiftTs);
-typedef bool(__thiscall* tRakRPC)(void* iface, int* rpcId, void* bitStream, int prio, int rel, char ordCh, bool shiftTs);
-static void* GetRakClient(){
-    if(!g_sampBase) return nullptr;
-    void* rc = nullptr;
-    DWORD ptrAddr = g_sampBase + SAMP_RAKCLIENT_PTR_OFS;
-    if(!RP(ptrAddr, *(DWORD*)&rc)) return nullptr;
-    return rc;
-}
-static void CallRakRPC(int rpcId, RakBitStream& bs){
-    // Envelopa o payload e envia direto por Send(BitStream*). Esse método existe
-    // no RakClientInterface (vtable) e o endereco 0x03C088E0 bate exatamente com
-    // o Send(BitStream*,prio,rel,ord) que SAMP usa em todo lugar.
-    //
-    // Montamos o envelope no formato do RakPeer::RPC(int*,...) que o SA-MP usa
-    // (RakNet 2.x com IDs inteiros <= 256):
-    //   [1] byte         ID_RPC = 22
-    //   [1] byte         rpcId   (1..255)
-    //   [comp] uint32    bitLength (WriteCompressed)
-    //   [N*8] bits       dados do payload
-    //
-    // WriteCompressed(unsigned int) no RakNet 2/3:
-    //   - se valor == 0: Write(false)
-    //   - senao: Write(true); escreve 2 bits com o numero de bytes necessarios
-    //           (0..4 => 1..4 bytes); depois escreve o uint como N bytes em
-    //           little-endian.
-    // Para 120 bits (payload do RPC 115 = 15 bytes = 120 bits < 256 => 1 byte),
-    // comprimido fica: 1 (true) + 2 bits indicando 1 byte => 3 bits, depois 1 byte
-    // de valor. Total: 11 bits (2 bytes no fio porque fica desalinhado...).
-    //
-    // Em vez de implementar WriteCompressed (que usa WriteBits desalinhado) e
-    // WriteBits com rightAlignedBits=false, vamos escrever o envelope usando
-    // WriteBit a WriteBit para ficar correto e independente de alinhamento,
-    // copiando os bits do payload bruto (byte-aligned) sem mudar o significado.
-    void* rc = GetRakClient();
-    if(!rc) return;
-    typedef bool(__thiscall* tSendBS)(void* iface, void* bitStream, int prio, int rel, char ord);
-    static tSendBS fnSendBS = nullptr;
-    static bool resolved = false;
-    if(!resolved){
-        if(g_sampBase) fnSendBS = (tSendBS)(g_sampBase + 0x03C088E0);
-        resolved = true;
-    }
-    if(!fnSendBS) return;
-
-    RakBitStream out;
-    out.WriteU8(22);                   // ID_RPC
-    out.WriteU8((unsigned char)rpcId); // rpcId (0..255)
-    // WriteCompressed(bitLength)
-    unsigned int bits = bs.GetNumberOfBitsUsed();
-    if(bits == 0){
-        out.WriteBit(0);
-    } else {
-        out.WriteBit(1);
-        unsigned char byteCount;
-        if(bits <= 0xFFu) byteCount = 1;
-        else if(bits <= 0xFFFFu) byteCount = 2;
-        else if(bits <= 0xFFFFFFu) byteCount = 3;
-        else byteCount = 4;
-        unsigned char bc = (unsigned char)(byteCount-1);
-        out.WriteBit((bc>>1)&1);
-        out.WriteBit((bc>>0)&1);
-        for(unsigned char b=0;b<byteCount;++b){
-            unsigned char v = (unsigned char)((bits >> (8*b)) & 0xFFu);
-            out.WriteU8(v);
-        }
-    }
-    // Copia payload bit a bit
-    if(bits > 0) out.WriteBitsMSB((const unsigned char*)bs.GetData(), bits);
-
-    fnSendBS(rc, &out, HIGH_PRIORITY, RELIABLE, 0);
-}
-
-static int GetLocalPlayerId(){
-    // Versao R1 do menu: usa offsets ja presentes no codigo para info/pools/pool de players.
-    if(!g_sampBase) return -1;
-    DWORD info=0, pools=0, pp=0;
-    DWORD sOff1=0x21A0F8, sOff2=0x3CD, sOff3=0x18;
-    if(!RP(g_sampBase+sOff1, info) || !RP(info+sOff2, pools) || !RP(pools+sOff3, pp)) return -1;
-    unsigned short lid = 0xFFFF;
-    // PlayerPool da R1 guarda o ID local no offset 0x4 a partir da base do pool (SAMP-UDF confirma).
-    if(!RV(pp + 0x4, lid)) return -1;
-    if(lid >= 1000) return -1;
-    return (int)lid;
-}
 
 static const char* g_weaponNames[]={"Fist","Brass Knuckles","Golf Club","Nightstick","Knife","Baseball Bat","Shovel","Pool Cue","Katana","Chainsaw","Purple Dildo","Dildo","Vibrator","Silver Vibrator","Flowers","Cane","Grenade","Tear Gas","Molotov","_","_","_","Colt 45","Silenced","Desert Eagle","Shotgun","Sawnoff","Combat Shotgun","Micro SMG","MP5","AK-47","M4","Tec-9","Country Rifle","Sniper Rifle","RPG","HS Rocket","Flamethrower","Minigun","Satchel Charge","Detonator","Spraycan","Fire Extinguisher","Camera","Night Vision","Thermal","Parachute"};
 static const char* GetWeaponName(int id){return(id>=0&&id<47)?g_weaponNames[id]:"Unknown";}
@@ -611,11 +429,11 @@ static void DrawAdminPopup(ImDrawList*fg){
 static const char* KeyName(int k){if(k==0)return"NONE";if(k==VK_LBUTTON)return"LMB";if(k==VK_RBUTTON)return"RMB";if(k==VK_MBUTTON)return"MMB";if(k==VK_XBUTTON1)return"MOUSE 4";if(k==VK_XBUTTON2)return"MOUSE 5";if(k==VK_INSERT)return"INSERT";if(k==VK_DELETE)return"DELETE";if(k==VK_HOME)return"HOME";if(k==VK_END)return"END";if(k==VK_PRIOR)return"PGUP";if(k==VK_NEXT)return"PGDN";if(k==VK_SPACE)return"SPACE";if(k==VK_SHIFT)return"SHIFT";if(k==VK_LSHIFT)return"LSHIFT";if(k==VK_RSHIFT)return"RSHIFT";if(k==VK_CONTROL)return"CTRL";if(k==VK_LCONTROL)return"LCTRL";if(k==VK_RCONTROL)return"RCTRL";if(k==VK_MENU)return"ALT";if(k==VK_LMENU)return"LALT";if(k==VK_RMENU)return"RALT";if(k==VK_TAB)return"TAB";if(k==VK_RETURN)return"ENTER";if(k==VK_BACK)return"BACKSPACE";if(k==VK_CAPITAL)return"CAPS";if(k==VK_ESCAPE)return"ESC";if(k>='A'&&k<='Z'){static char b[2];b[0]=(char)k;b[1]=0;return b;}if(k>='0'&&k<='9'){static char b2[2];b2[0]=(char)k;b2[1]=0;return b2;}if(k>=VK_F1&&k<=VK_F12){static char b3[4];snprintf(b3,4,"F%d",k-VK_F1+1);return b3;}if(k>=VK_NUMPAD0&&k<=VK_NUMPAD9){static char b4[8];snprintf(b4,8,"NUM%d",k-VK_NUMPAD0);return b4;}return"KEY";}
 static void TooltipHover(const char*tip){if(!tip||!*tip)return;if(ImGui::IsItemHovered()){ImGuiContext*ctx=ImGui::GetCurrentContext();if(ctx->HoveredIdTimer>2.0f){ImGui::BeginTooltip();ImGui::PushStyleColor(ImGuiCol_Text,ImVec4(1,1,1,1));ImGui::Text("%s",tip);ImGui::PopStyleColor();ImGui::EndTooltip();}}}
 static bool KeybindCard(const char*id,const char*label,int key,bool waiting,const char*tip=nullptr){
-    ImDrawList*d=ImGui::GetWindowDrawList();ImVec2 pos=ImGui::GetCursorScreenPos();ImVec2 avail=ImGui::GetContentRegionAvail();float height=48.0f;d->AddRectFilled(pos,ImVec2(pos.x+avail.x,pos.y+height),COL_CARD,6);float iconSize=22.0f;float iconX=pos.x+avail.x-iconSize-14;float iconY=pos.y+(height-iconSize)/2;if(tex_keybind)d->AddImage((ImTextureID)tex_keybind,ImVec2(iconX,iconY),ImVec2(iconX+iconSize,iconY+iconSize),ImVec2(0,0),ImVec2(1,1),COL_ACCENT);d->AddText(ImVec2(pos.x+12,pos.y+5),COL_TEXT_DIM,label);char kt[32];if(waiting)strcpy(kt,"[ pressione ]");else if(key==0)strcpy(kt,"[ nenhuma ]");else snprintf(kt,32,"[ %s ]",KeyName(key));d->AddText(ImVec2(pos.x+12,pos.y+24),COL_ACCENT,kt);ImGui::PushID(id);ImGui::SetCursorScreenPos(pos);bool clicked=ImGui::InvisibleButton("##kc",ImVec2(avail.x,height));TooltipHover(tip);ImGui::PopID();ImGui::Dummy(ImVec2(avail.x,8));return clicked;
+    ImDrawList*d=ImGui::GetWindowDrawList();ImVec2 pos=ImGui::GetCursorScreenPos();ImVec2 avail=ImGui::GetContentRegionAvail();float height=38.0f;d->AddRectFilled(pos,ImVec2(pos.x+avail.x,pos.y+height),COL_CARD,6);float iconSize=20.0f;float iconX=pos.x+avail.x-iconSize-14;float iconY=pos.y+(height-iconSize)/2;if(tex_keybind)d->AddImage((ImTextureID)tex_keybind,ImVec2(iconX,iconY),ImVec2(iconX+iconSize,iconY+iconSize),ImVec2(0,0),ImVec2(1,1),COL_ACCENT);d->AddText(ImVec2(pos.x+12,pos.y+4),COL_TEXT_DIM,label);char kt[32];if(waiting)strcpy(kt,"[ pressione ]");else if(key==0)strcpy(kt,"[ nenhuma ]");else snprintf(kt,32,"[ %s ]",KeyName(key));d->AddText(ImVec2(pos.x+12,pos.y+18),COL_ACCENT,kt);ImGui::PushID(id);ImGui::SetCursorScreenPos(pos);bool clicked=ImGui::InvisibleButton("##kc",ImVec2(avail.x,height));TooltipHover(tip);ImGui::PopID();ImGui::Dummy(ImVec2(avail.x,4));return clicked;
 }
 static bool ToggleColorCard(const char*label,bool*v,float col[4],const char*tip=nullptr){
     ImDrawList*dl=ImGui::GetWindowDrawList();ImVec2 pos=ImGui::GetCursorScreenPos();ImVec2 avail=ImGui::GetContentRegionAvail();
-    float height=34.0f;float bxSz=18.0f;float bxX=pos.x+10;float bxY=pos.y+(height-bxSz)/2;
+    float height=26.0f;float bxSz=18.0f;float bxX=pos.x+10;float bxY=pos.y+(height-bxSz)/2;
     ImU32 c=ImGui::ColorConvertFloat4ToU32(ImVec4(col[0],col[1],col[2],col[3]));
     ImGui::PushID(label);
     ImGui::SetCursorScreenPos(ImVec2(bxX,bxY));ImGui::InvisibleButton("##cb",ImVec2(bxSz,bxSz));
@@ -638,10 +456,10 @@ static bool ToggleColorCard(const char*label,bool*v,float col[4],const char*tip=
     dl->AddRectFilled(ImVec2(tx,ty),ImVec2(tx+tW,ty+tH),IM_COL32(br,bg,bb,255),tR);
     float cX=tx+tR+(tW-tH)*aT;dl->AddCircleFilled(ImVec2(cX,ty+tR),tR-2.5f,IM_COL32(255,255,255,255));
     if(ImGui::BeginPopup("##cpk")){ImGui::ColorPicker4("##pk",col,ImGuiColorEditFlags_NoInputs|ImGuiColorEditFlags_NoLabel);ImGui::EndPopup();}
-    ImGui::PopID();ImGui::Dummy(ImVec2(avail.x,4));return clicked;
+    ImGui::PopID();ImGui::Dummy(ImVec2(avail.x,2));return clicked;
 }
 static bool ToggleCard(const char*label,bool*v,const char*tip=nullptr){
-    ImDrawList*dl=ImGui::GetWindowDrawList();ImVec2 pos=ImGui::GetCursorScreenPos();ImVec2 avail=ImGui::GetContentRegionAvail();float height=34.0f;
+    ImDrawList*dl=ImGui::GetWindowDrawList();ImVec2 pos=ImGui::GetCursorScreenPos();ImVec2 avail=ImGui::GetContentRegionAvail();float height=26.0f;
     ImGui::PushID(label);ImGui::InvisibleButton("##c",ImVec2(avail.x,height));bool clicked=ImGui::IsItemClicked(0);bool hovered=ImGui::IsItemHovered();TooltipHover(tip);if(clicked)*v=!*v;ImGui::PopID();
     dl->AddRectFilled(pos,ImVec2(pos.x+avail.x,pos.y+height),hovered?COL_CARD_HOVER:COL_CARD,6.0f);
     const char*sep=strstr(label,"##");const char*de=sep?sep:(label+strlen(label));ImVec2 ts=ImGui::CalcTextSize(label,de);
@@ -652,23 +470,23 @@ static bool ToggleCard(const char*label,bool*v,const char*tip=nullptr){
     int br=50+(int)((139-50)*aT),bg=52+(int)((92-52)*aT),bb=65+(int)((246-65)*aT);
     dl->AddRectFilled(ImVec2(tx,ty),ImVec2(tx+tW,ty+tH),IM_COL32(br,bg,bb,255),tR);
     float cX=tx+tR+(tW-tH)*aT;dl->AddCircleFilled(ImVec2(cX,ty+tR),tR-2.5f,IM_COL32(255,255,255,255));
-    ImGui::Dummy(ImVec2(avail.x,4));return clicked;
+    ImGui::Dummy(ImVec2(avail.x,2));return clicked;
 }
 static void SliderCard(const char*label,float*v,float mn,float mx,const char*fmt="%.0f",const char*tip=nullptr){
-    ImDrawList*dl=ImGui::GetWindowDrawList();ImVec2 pos=ImGui::GetCursorScreenPos();ImVec2 avail=ImGui::GetContentRegionAvail();float height=46.0f;
+    ImDrawList*dl=ImGui::GetWindowDrawList();ImVec2 pos=ImGui::GetCursorScreenPos();ImVec2 avail=ImGui::GetContentRegionAvail();float height=36.0f;
     dl->AddRectFilled(pos,ImVec2(pos.x+avail.x,pos.y+height),COL_CARD,6.0f);
     const char*sep=strstr(label,"##");const char*de=sep?sep:(label+strlen(label));
-    dl->AddText(ImVec2(pos.x+12,pos.y+6),COL_TEXT,label,de);
+    dl->AddText(ImVec2(pos.x+12,pos.y+4),COL_TEXT,label,de);
     char vb[32];snprintf(vb,sizeof(vb),fmt,*v);ImVec2 vs=ImGui::CalcTextSize(vb);
-    dl->AddText(ImVec2(pos.x+avail.x-vs.x-12,pos.y+6),COL_TEXT,vb);
-    float barY=pos.y+30,barW=avail.x-24,barX=pos.x+12,barH=5;
+    dl->AddText(ImVec2(pos.x+avail.x-vs.x-12,pos.y+4),COL_TEXT,vb);
+    float barY=pos.y+22,barW=avail.x-24,barX=pos.x+12,barH=5;
     dl->AddRectFilled(ImVec2(barX,barY),ImVec2(barX+barW,barY+barH),COL_TOGGLE_OFF,barH*0.5f);
     float frac=(*v-mn)/(mx-mn);if(frac<0)frac=0;if(frac>1)frac=1;
     dl->AddRectFilled(ImVec2(barX,barY),ImVec2(barX+barW*frac,barY+barH),COL_ACCENT,barH*0.5f);
-    dl->AddCircleFilled(ImVec2(barX+barW*frac,barY+barH*0.5f),6,IM_COL32(255,255,255,255));
-    ImGui::PushID(label);ImGui::SetCursorScreenPos(ImVec2(barX-6,barY-10));ImGui::InvisibleButton("##s",ImVec2(barW+12,26));TooltipHover(tip);
+    dl->AddCircleFilled(ImVec2(barX+barW*frac,barY+barH*0.5f),5,IM_COL32(255,255,255,255));
+    ImGui::PushID(label);ImGui::SetCursorScreenPos(ImVec2(barX-6,barY-8));ImGui::InvisibleButton("##s",ImVec2(barW+12,20));TooltipHover(tip);
     if(ImGui::IsItemActive()){float mpx=ImGui::GetIO().MousePos.x-barX;float f=mpx/barW;if(f<0)f=0;if(f>1)f=1;*v=mn+f*(mx-mn);}
-    ImGui::PopID();ImGui::SetCursorScreenPos(ImVec2(pos.x,pos.y+height));ImGui::Dummy(ImVec2(avail.x,4));
+    ImGui::PopID();ImGui::SetCursorScreenPos(ImVec2(pos.x,pos.y+height));ImGui::Dummy(ImVec2(avail.x,2));
 }
 static void SliderIntCard(const char*label,int*v,int mn,int mx,const char*tip=nullptr){float fv=(float)*v;SliderCard(label,&fv,(float)mn,(float)mx,"%.0f",tip);*v=(int)fv;}
 static void ComboCard(const char*label,int*current,const char**items,int cnt,const char*tip=nullptr){
@@ -768,13 +586,16 @@ static void LoadConfig() {
         LOAD_BOOL(magnet_on); LOAD_BOOL(magnet_show_fov); LOAD_INT(magnet_key); LOAD_INT(magnet_target); LOAD_INT(magnet_priority);
         LOAD_FLOAT(magnet_fov); LOAD_FLOAT(magnet_distance); LOAD_FLOAT(magnet_offsetX);
         LOAD_COLOR(magnet_fov_col);
+        LOAD_BOOL(magnet_pull_all);
         LOAD_BOOL(proaim_on); LOAD_BOOL(proaim_show_fov); LOAD_INT(proaim_key);
         LOAD_INT(proaim_target); LOAD_INT(proaim_priority); LOAD_INT(proaim_fov); LOAD_FLOAT(proaim_stickiness);
         LOAD_COLOR(proaim_fov_col);
         LOAD_BOOL(flycar_on); LOAD_INT(flycar_key); LOAD_FLOAT(flycar_speed);
         LOAD_BOOL(fly_on); LOAD_INT(fly_key); LOAD_FLOAT(fly_speed);
-        LOAD_BOOL(godmode_on); LOAD_BOOL(superpunch_on); LOAD_BOOL(tp_way_on);
+        LOAD_BOOL(godmode_on); LOAD_BOOL(tp_way_on);
+        LOAD_BOOL(noclip_on); LOAD_FLOAT(noclip_speed);
         LOAD_BOOL(slingshot_on); LOAD_INT(slingshot_key); LOAD_FLOAT(slingshot_speed);
+        LOAD_BOOL(insta_brake_on); LOAD_INT(insta_brake_key);
         if (key == "friends") {
             g_friends.clear();
             std::stringstream ss(val);
@@ -817,13 +638,16 @@ static void SaveConfig() {
     SAVE_BOOL(magnet_on); SAVE_BOOL(magnet_show_fov); SAVE_INT(magnet_key); SAVE_INT(magnet_target); SAVE_INT(magnet_priority);
     SAVE_FLOAT(magnet_fov); SAVE_FLOAT(magnet_distance); SAVE_FLOAT(magnet_offsetX);
     SAVE_COLOR(magnet_fov_col);
+    SAVE_BOOL(magnet_pull_all);
     SAVE_BOOL(proaim_on); SAVE_BOOL(proaim_show_fov); SAVE_INT(proaim_key);
     SAVE_INT(proaim_target); SAVE_INT(proaim_priority); SAVE_INT(proaim_fov); SAVE_FLOAT(proaim_stickiness);
     SAVE_COLOR(proaim_fov_col);
     SAVE_BOOL(flycar_on); SAVE_INT(flycar_key); SAVE_FLOAT(flycar_speed);
     SAVE_BOOL(fly_on); SAVE_INT(fly_key); SAVE_FLOAT(fly_speed);
-    SAVE_BOOL(godmode_on); SAVE_BOOL(superpunch_on); SAVE_BOOL(tp_way_on);
+    SAVE_BOOL(godmode_on); SAVE_BOOL(tp_way_on);
+    SAVE_BOOL(noclip_on); SAVE_FLOAT(noclip_speed);
     SAVE_BOOL(slingshot_on); SAVE_INT(slingshot_key); SAVE_FLOAT(slingshot_speed);
+    SAVE_BOOL(insta_brake_on); SAVE_INT(insta_brake_key);
     f << "friends=";
     for (size_t i = 0; i < g_friends.size(); i++) {
         if (i > 0) f << ",";
@@ -976,54 +800,137 @@ static void ProcessMagnet() {
     }
     DWORD myPed = 0;
     if(!RP(0xB6F5F0, myPed) || !Valid(myPed)) return;
+
     float cxS = g_crossX * (float)g_screenW;
     float cyS = g_crossY * (float)g_screenH;
     float fovR = magnet_fov;
-    float aimZ = (magnet_target == 0) ? 0.75f : (magnet_target == 1) ? 0.55f : 0.35f;
-    if(magnet_lockedId >= 0) {
-        const Player* locked = nullptr;
-        for(const auto& pl : g_players) {
-            if(pl.id == magnet_lockedId && !pl.isLocal && pl.valid) { locked = &pl; break; }
-        }
-        if(!locked || locked->hp <= 0) { magnet_lockedId = -1; }
-        else {
-            float yaw = 0, pitch = 0;
-            RV(0xB6F258, yaw); RV(0xB6F248, pitch);
-            float rightX = -sinf(yaw);
-            float rightY = cosf(yaw);
+
+    float yaw = 0, pitch = 0;
+    RV(0xB6F258, yaw); RV(0xB6F248, pitch);
+
+    float fx = -cosf(yaw) * cosf(pitch);
+    float fy = -sinf(yaw) * cosf(pitch);
+    float fz = sinf(pitch);
+
+    float rightX = -sinf(yaw);
+    float rightY = cosf(yaw);
+
+    // Stable height relative to local player (prevents flickering when target is above/below)
+    float stableZ = g_myPos.z + 0.75f;
+
+    if (magnet_pull_all) {
+        // PULL ALL - no priority, apply to every player inside FOV
+        for (const auto& pl : g_players) {
+            if (pl.isLocal || !pl.valid || !Valid(pl.ped) || pl.ped == myPed || IsFriend(pl.name) || pl.hp <= 0) continue;
+
+            Vec3 ap = {pl.pos.x, pl.pos.y, pl.pos.z + 0.6f};
+            ImVec2 sc;
+            if (!W2S(ap, sc)) continue;
+
+            float dx = sc.x - cxS;
+            float dy = sc.y - cyS;
+            float screenDist = sqrtf(dx*dx + dy*dy);
+            if (screenDist > fovR) continue;
+
             Vec3 targetPos = {
-                g_myPos.x - cosf(yaw)*cosf(pitch)*magnet_distance + rightX * magnet_offsetX,
-                g_myPos.y - sinf(yaw)*cosf(pitch)*magnet_distance + rightY * magnet_offsetX,
-                locked->pos.z
+                g_myPos.x + fx * magnet_distance + rightX * magnet_offsetX,
+                g_myPos.y + fy * magnet_distance + rightY * magnet_offsetX,
+                stableZ
             };
-            if(!IsValidPos(targetPos)) return;
-            DWORD ped = locked->ped;
-            for(int rep = 0; rep < 5; rep++) {
+
+            if (!IsValidPos(targetPos)) continue;
+
+            DWORD ped = pl.ped;
+            for (int rep = 0; rep < 4; rep++) {
                 DWORD m = 0;
-                if(!RP(ped + 0x14, m) || !Valid(m)) break;
-                if(IsBadWritePtr((void*)(m + 0x30), 12)) break;
+                if (!RP(ped + 0x14, m) || !Valid(m)) break;
+                if (IsBadWritePtr((void*)(m + 0x30), 12)) break;
+
                 memcpy((void*)(m + 0x30), &targetPos, 12);
-                if(!IsBadWritePtr((void*)(ped + 0x44), 12)) {
+
+                if (!IsBadWritePtr((void*)(ped + 0x44), 12)) {
                     float* vel = (float*)(ped + 0x44);
                     vel[0] = 0; vel[1] = 0; vel[2] = 0;
                 }
-                if(!IsBadWritePtr((void*)(ped + 0x50), 12)) {
+                if (!IsBadWritePtr((void*)(ped + 0x50), 12)) {
                     float* vel = (float*)(ped + 0x50);
                     vel[0] = 0; vel[1] = 0; vel[2] = 0;
                 }
             }
-            if(g_sampBase && locked->id >= 0) {
+
+            // Also try to update SAMP data for better sync
+            if (g_sampBase && pl.id >= 0) {
+                DWORD info = 0, pools = 0, pp = 0;
+                if (RP(g_sampBase + 0x21A0F8, info) &&
+                    RP(info + 0x3CD, pools) &&
+                    RP(pools + 0x18, pp)) {
+                    DWORD rp = 0;
+                    if (RP(pp + 0x2E + (DWORD)pl.id * 4, rp) && Valid(rp)) {
+                        DWORD pd = 0;
+                        if (RP(rp, pd) && Valid(pd)) {
+                            DWORD offsets[] = {0x36, 0x40, 0x54, 0x68, 0xF6, 0x110};
+                            for (int k = 0; k < 6; k++) {
+                                if (!IsBadWritePtr((void*)(pd + offsets[k]), 12))
+                                    memcpy((void*)(pd + offsets[k]), &targetPos, 12);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        magnet_lockedId = -1; // no single lock when pulling all
+        return;
+    }
+
+    // === NORMAL MODE (single target with priority) ===
+    float aimZ = (magnet_target == 0) ? 0.75f : (magnet_target == 1) ? 0.55f : 0.35f;
+
+    if (magnet_lockedId >= 0) {
+        const Player* locked = nullptr;
+        for (const auto& pl : g_players) {
+            if (pl.id == magnet_lockedId && !pl.isLocal && pl.valid) {
+                locked = &pl; break;
+            }
+        }
+        if (!locked || locked->hp <= 0) {
+            magnet_lockedId = -1;
+        } else {
+            Vec3 targetPos = {
+                g_myPos.x + fx * magnet_distance + rightX * magnet_offsetX,
+                g_myPos.y + fy * magnet_distance + rightY * magnet_offsetX,
+                stableZ
+            };
+            if (!IsValidPos(targetPos)) return;
+
+            DWORD ped = locked->ped;
+            for (int rep = 0; rep < 5; rep++) {
+                DWORD m = 0;
+                if (!RP(ped + 0x14, m) || !Valid(m)) break;
+                if (IsBadWritePtr((void*)(m + 0x30), 12)) break;
+                memcpy((void*)(m + 0x30), &targetPos, 12);
+
+                if (!IsBadWritePtr((void*)(ped + 0x44), 12)) {
+                    float* vel = (float*)(ped + 0x44);
+                    vel[0] = 0; vel[1] = 0; vel[2] = 0;
+                }
+                if (!IsBadWritePtr((void*)(ped + 0x50), 12)) {
+                    float* vel = (float*)(ped + 0x50);
+                    vel[0] = 0; vel[1] = 0; vel[2] = 0;
+                }
+            }
+
+            if (g_sampBase && locked->id >= 0) {
                 DWORD info = 0, pools = 0, pp = 0;
                 DWORD sOff1 = 0x21A0F8, sOff2 = 0x3CD, sOff3 = 0x18, sOff4 = 0x2E;
-                if(RP(g_sampBase + sOff1, info) && RP(info + sOff2, pools) && RP(pools + sOff3, pp)) {
+                if (RP(g_sampBase + sOff1, info) && RP(info + sOff2, pools) && RP(pools + sOff3, pp)) {
                     DWORD rp = 0;
-                    if(RP(pp + sOff4 + (DWORD)locked->id * 4, rp) && Valid(rp)) {
+                    if (RP(pp + sOff4 + (DWORD)locked->id * 4, rp) && Valid(rp)) {
                         DWORD pd = 0;
-                        if(RP(rp, pd) && Valid(pd)) {
+                        if (RP(rp, pd) && Valid(pd)) {
                             DWORD offsets[] = {0x36, 0x40, 0x54, 0x68, 0xF6, 0x110};
-                            for(int k = 0; k < 6; k++) {
+                            for (int k = 0; k < 6; k++) {
                                 DWORD addr = pd + offsets[k];
-                                if(!IsBadWritePtr((void*)addr, 12)) memcpy((void*)addr, &targetPos, 12);
+                                if (!IsBadWritePtr((void*)addr, 12)) memcpy((void*)addr, &targetPos, 12);
                             }
                         }
                     }
@@ -1032,67 +939,80 @@ static void ProcessMagnet() {
             return;
         }
     }
+
+    // Find best target (normal priority mode)
     int bestI = -1;
     float bestScreenDist = 999999.f;
     float bestHp = 999999.f;
-    for(int i = 0; i < (int)g_players.size(); i++) {
+
+    for (int i = 0; i < (int)g_players.size(); i++) {
         const auto& pl = g_players[i];
-        if(pl.isLocal || !pl.valid || !Valid(pl.ped) || pl.ped == myPed || IsFriend(pl.name) || pl.hp <= 0 || IsBadReadPtr((void*)pl.ped, 0x600)) continue;
+        if (pl.isLocal || !pl.valid || !Valid(pl.ped) || pl.ped == myPed || IsFriend(pl.name) || pl.hp <= 0) continue;
+
         Vec3 ap = {pl.pos.x, pl.pos.y, pl.pos.z + aimZ};
         ImVec2 sc;
-        if(!W2S(ap, sc)) continue;
+        if (!W2S(ap, sc)) continue;
+
         float dx = sc.x - cxS, dy = sc.y - cyS;
         float screenDist = sqrtf(dx*dx + dy*dy);
-        if(screenDist > fovR) continue;
+        if (screenDist > fovR) continue;
+
         bool better = false;
-        if(magnet_priority == 0) {
-            if(screenDist < bestScreenDist) better = true;
+        if (magnet_priority == 0) {
+            if (screenDist < bestScreenDist) better = true;
         } else {
-            if(pl.hp < bestHp) better = true;
-            else if(pl.hp == bestHp && screenDist < bestScreenDist) better = true;
+            if (pl.hp < bestHp) better = true;
+            else if (pl.hp == bestHp && screenDist < bestScreenDist) better = true;
         }
-        if(better) { bestScreenDist = screenDist; bestHp = pl.hp; bestI = i; }
+        if (better) {
+            bestScreenDist = screenDist;
+            bestHp = pl.hp;
+            bestI = i;
+        }
     }
-    if(bestI < 0) return;
+
+    if (bestI < 0) return;
+
     magnet_lockedId = g_players[bestI].id;
     const auto& t = g_players[bestI];
-    float yaw = 0, pitch = 0;
-    RV(0xB6F258, yaw); RV(0xB6F248, pitch);
-    float rightX = -sinf(yaw);
-    float rightY = cosf(yaw);
+
     Vec3 targetPos = {
-        g_myPos.x - cosf(yaw)*cosf(pitch)*magnet_distance + rightX * magnet_offsetX,
-        g_myPos.y - sinf(yaw)*cosf(pitch)*magnet_distance + rightY * magnet_offsetX,
-        t.pos.z
+        g_myPos.x + fx * magnet_distance + rightX * magnet_offsetX,
+        g_myPos.y + fy * magnet_distance + rightY * magnet_offsetX,
+        stableZ
     };
-    if(!IsValidPos(targetPos)) return;
+
+    if (!IsValidPos(targetPos)) return;
+
     DWORD ped = t.ped;
-    for(int rep = 0; rep < 5; rep++) {
+    for (int rep = 0; rep < 5; rep++) {
         DWORD m = 0;
-        if(!RP(ped + 0x14, m) || !Valid(m)) break;
-        if(IsBadWritePtr((void*)(m + 0x30), 12)) break;
+        if (!RP(ped + 0x14, m) || !Valid(m)) break;
+        if (IsBadWritePtr((void*)(m + 0x30), 12)) break;
         memcpy((void*)(m + 0x30), &targetPos, 12);
-        if(!IsBadWritePtr((void*)(ped + 0x44), 12)) {
+
+        if (!IsBadWritePtr((void*)(ped + 0x44), 12)) {
             float* vel = (float*)(ped + 0x44);
             vel[0] = 0; vel[1] = 0; vel[2] = 0;
         }
-        if(!IsBadWritePtr((void*)(ped + 0x50), 12)) {
+        if (!IsBadWritePtr((void*)(ped + 0x50), 12)) {
             float* vel = (float*)(ped + 0x50);
             vel[0] = 0; vel[1] = 0; vel[2] = 0;
         }
     }
-    if(g_sampBase && t.id >= 0) {
+
+    if (g_sampBase && t.id >= 0) {
         DWORD info = 0, pools = 0, pp = 0;
         DWORD sOff1 = 0x21A0F8, sOff2 = 0x3CD, sOff3 = 0x18, sOff4 = 0x2E;
-        if(RP(g_sampBase + sOff1, info) && RP(info + sOff2, pools) && RP(pools + sOff3, pp)) {
+        if (RP(g_sampBase + sOff1, info) && RP(info + sOff2, pools) && RP(pools + sOff3, pp)) {
             DWORD rp = 0;
-            if(RP(pp + sOff4 + (DWORD)t.id * 4, rp) && Valid(rp)) {
+            if (RP(pp + sOff4 + (DWORD)t.id * 4, rp) && Valid(rp)) {
                 DWORD pd = 0;
-                if(RP(rp, pd) && Valid(pd)) {
+                if (RP(rp, pd) && Valid(pd)) {
                     DWORD offsets[] = {0x36, 0x40, 0x54, 0x68, 0xF6, 0x110};
-                    for(int k = 0; k < 6; k++) {
+                    for (int k = 0; k < 6; k++) {
                         DWORD addr = pd + offsets[k];
-                        if(!IsBadWritePtr((void*)addr, 12)) memcpy((void*)addr, &targetPos, 12);
+                        if (!IsBadWritePtr((void*)addr, 12)) memcpy((void*)addr, &targetPos, 12);
                     }
                 }
             }
@@ -1155,6 +1075,49 @@ static void ProcessFly() {
         float* vel = (float*)(mp + 0x44);
         vel[0] = 0; vel[1] = 0; vel[2] = 0;
     }
+}
+
+// Noclip REAL (confirmado GTA SA 1.0 - GTAMods Wiki):
+// +0x42 (3º byte das physical flags em +0x40) bit 0x01 = "Soft (noclip)"
+// → Ped atravessa paredes, chão e objetos do cenário mantendo controle 100% normal.
+// Aplica TODO FRAME (jogo reseta em transições como entrar/sair de veículo).
+// Nenhuma escrita de posição, velocidade ou matriz. Movimento GTA SA puro.
+static void ProcessNoclip() {
+    DWORD mp = 0;
+    if (!RP(0xB6F5F0, mp) || !Valid(mp)) return;
+
+    DWORD veh = 0;
+    bool inVeh = RP(mp + 0x58C, veh) && Valid(veh);
+
+    const BYTE SOFT_NOCLIP = 0x01;   // +0x42 bit 0 = Soft / noclip (atravessa parede)
+
+    if (noclip_on) {
+        // === Ped ===
+        if (!IsBadWritePtr((void*)(mp + 0x42), 1)) {
+            BYTE* flags = (BYTE*)(mp + 0x42);
+            *flags |= SOFT_NOCLIP;
+        }
+
+        // === Veículo (se estiver dentro) ===
+        if (inVeh && !IsBadWritePtr((void*)(veh + 0x42), 1)) {
+            BYTE* vflags = (BYTE*)(veh + 0x42);
+            *vflags |= SOFT_NOCLIP;
+        }
+    } else {
+        // Restaura colisão normal
+        if (!IsBadWritePtr((void*)(mp + 0x42), 1)) {
+            BYTE* flags = (BYTE*)(mp + 0x42);
+            *flags &= ~SOFT_NOCLIP;
+        }
+
+        if (inVeh && !IsBadWritePtr((void*)(veh + 0x42), 1)) {
+            BYTE* vflags = (BYTE*)(veh + 0x42);
+            *vflags &= ~SOFT_NOCLIP;
+        }
+    }
+
+    // 100% normal: WASD, pulo, sprint, agachar, animações GTA SA originais.
+    // Apenas paredes / mundo perdem colisão.
 }
 static void ProcessGodMode() {
     if(!godmode_on || !g_haveMe) return;
@@ -1332,6 +1295,29 @@ static void ProcessSlingshotReturn() {
         }
     }
 }
+
+static void ProcessInstaBrake() {
+    if(!insta_brake_on || insta_brake_key == 0 || !(GetAsyncKeyState(insta_brake_key) & 0x8000)) return;
+    DWORD mp = 0;
+    if(!RP(0xB6F5F0, mp) || !Valid(mp)) return;
+    DWORD veh = 0;
+    if(!RP(mp + 0x58C, veh) || !Valid(veh)) return;
+    DWORD vm = 0;
+    if(!RP(veh + 0x14, vm) || !Valid(vm)) return;
+    if(!IsBadWritePtr((void*)(veh + 0x44), 12)) {
+        float* vel = (float*)(veh + 0x44);
+        vel[0] = 0; vel[1] = 0; vel[2] = 0;
+    }
+    if(!IsBadWritePtr((void*)(veh + 0x4C), 12)) {
+        float* angVel = (float*)(veh + 0x4C);
+        angVel[0] = 0; angVel[1] = 0; angVel[2] = 0;
+    }
+    // Also zero player velocity to prevent push
+    if(!IsBadWritePtr((void*)(mp + 0x4C0), 12)) {
+        float* pvel = (float*)(mp + 0x4C0);
+        pvel[0] = 0; pvel[1] = 0; pvel[2] = 0;
+    }
+}
 static void TakeVehicle(DWORD vehPtr) {
     if(!Valid(vehPtr)) return;
     DWORD mp = 0;
@@ -1477,6 +1463,10 @@ static void ProcessKeyWaits() {
         if(GetAsyncKeyState(VK_ESCAPE) & 0x8000) { slingshot_key = 0; wait_slingshot_key = false; }
         else for(int b = 1; b < 256; b++) if(GetAsyncKeyState(b) & 0x8000) { slingshot_key = b; wait_slingshot_key = false; break; }
     }
+    if(wait_insta_brake_key) {
+        if(GetAsyncKeyState(VK_ESCAPE) & 0x8000) { insta_brake_key = 0; wait_insta_brake_key = false; }
+        else for(int b = 1; b < 256; b++) if(GetAsyncKeyState(b) & 0x8000) { insta_brake_key = b; wait_insta_brake_key = false; break; }
+    }
 }
 void InitImGui(LPDIRECT3DDEVICE9 pDevice){
     LoadConfig();
@@ -1496,59 +1486,12 @@ void InitImGui(LPDIRECT3DDEVICE9 pDevice){
 }
 void UpdateScreenSize(){if(!gWindow)return;RECT rc;if(GetClientRect(gWindow,&rc)){g_screenW=rc.right;g_screenH=rc.bottom;}}
 
-static void ProcessSuperPunch() {
-    // Super Punch REAL via RPC sync (RPC_GiveTakeDamage = 115).
-    // Em vez de setar HP/velocidade na memoria local (que era apenas visual e o
-    // servidor sobrescrevia no proximo sync), envia ao servidor o RPC de dano para
-    // que o hit seja validado e sincronizado de verdade para todos os players.
-    if (!superpunch_on) return;
-
-    static DWORD lastHitTime[1004] = {0};
-
-    for (const auto& pl : g_players) {
-        if (pl.isLocal || !pl.valid || pl.hp <= 0) continue;
-        if (pl.id < 0 || pl.id >= 1004) continue;
-        if (pl.dist >= 3.0f || !Valid(pl.ped)) continue;
-
-        DWORD now = GetTickCount();
-        // Rate-limit por alvo para evitar flood de RPC (dano a cada ~180ms).
-        if (now - lastHitTime[pl.id] < 180) continue;
-
-        bool punching = false;
-        // Checa se estamos em anim de ataque corpo-a-corpo (fightingKeys / moveFlag).
-        // Usamos o estado de aim/ataque via keys do GTA para nao enviar RPC quando
-        // o player nem estiver atacando.
-        SHORT lmb = GetAsyncKeyState(VK_LBUTTON);
-        if((lmb & 0x8000)!=0) punching = true;
-        if(!punching) continue;
-
-        lastHitTime[pl.id] = now;
-
-        RakBitStream bs;
-        // Formato do RPC 115 (GiveTakeDamage) no SA-MP 0.3.7, confirmado por
-        // captura do proprio cliente (15 bytes = 120 bits):
-        //   bool  (1 bit)   isTakeDamage = false (GIVE damage)
-        //   padding (7 bits) pra alinhar em byte
-        //   uint16 (16 bits) damagedPlayerId
-        //   float  (32 bits) damageAmount
-        //   int32  (32 bits) weaponId  (0 = fist / unarmed)
-        //   int32  (32 bits) bodyPart  (3 = torso/chest)
-        bs.WriteBool(false);
-        bs.AlignWriteToByteBoundary();
-        bs.WriteU16((unsigned short)pl.id);
-        bs.WriteF32(20.0f);            // dano por soco
-        bs.WriteI32(0);                // WEAPON_FIST
-        bs.WriteI32(3);                // bodypart torso
-        CallRakRPC(RPC_GiveTakeDamage, bs);
-    }
-}
-
 void RenderMenu(LPDIRECT3DDEVICE9 pDevice){
     ProcessKeyWaits();
     ImGui_ImplDX9_NewFrame();ImGui_ImplWin32_NewFrame();ImGui::NewFrame();
     ImGuiIO&io=ImGui::GetIO();io.MouseDrawCursor=false;
     if(gMenuOpen){LockMouse();while(::ShowCursor(FALSE)>=0);}
-    UpdateScreenSize();UpdateCamera();LoadPlayers();UpdateAdminTracking();ScanNearbyVehicles();ProcessSpectate();ProcessAimbot();ProcessBoost();ProcessMagnet();ProcessProAim();ProcessFlyCar();ProcessSlingshot();ProcessSlingshotReturn();ProcessFly();ProcessGodMode();ProcessSuperPunch();ProcessTeleportSequence();ProcessTeleportWaypoint();
+    UpdateScreenSize();UpdateCamera();LoadPlayers();UpdateAdminTracking();ScanNearbyVehicles();ProcessSpectate();ProcessAimbot();ProcessBoost();ProcessMagnet();ProcessProAim();ProcessFlyCar();ProcessSlingshot();ProcessSlingshotReturn();ProcessFly();ProcessNoclip();ProcessGodMode();ProcessTeleportSequence();ProcessTeleportWaypoint();ProcessInstaBrake();
     ImDrawList*bg_dl=ImGui::GetBackgroundDrawList();
     if(aim_show_fov&&aim_on)bg_dl->AddCircle(ImVec2(g_crossX*(float)g_screenW,g_crossY*(float)g_screenH),(float)aim_fov_size,Col(aim_fov_col),64,1.5f);
     if(magnet_show_fov&&magnet_on)bg_dl->AddCircle(ImVec2(g_crossX*(float)g_screenW,g_crossY*(float)g_screenH),magnet_fov,Col(magnet_fov_col),64,1.5f);
@@ -1586,48 +1529,157 @@ void RenderMenu(LPDIRECT3DDEVICE9 pDevice){
         ImGui::BeginChild("##ct",ImVec2(cW,MH-HH-20),false,0);
         switch(current_tab){
         case 0:{
-            ImGui::Columns(2,"##ac",false);ImGui::SetColumnWidth(0,colW+6);
-            ToggleCard("Enable Aimbot",&aim_on,"Enables aimbot");
-            ImGuiID aID=ImGui::GetID("aa");ImGuiStorage*st=ImGui::GetStateStorage();
-            float aA=st->GetFloat(aID,aim_on?1.0f:0.0f),aT=aim_on?1.0f:0.0f;aA+=(aT-aA)*0.20f;if(fabsf(aT-aA)<0.01f)aA=aT;st->SetFloat(aID,aA);
-            if(aA>0.02f){ImGui::PushStyleVar(ImGuiStyleVar_Alpha,aA);SliderIntCard("FOV Radius",&aim_fov_size,10,500,"FOV size in pixels");SliderIntCard("Smoothness",&aim_smooth,1,20,"1 = instant (more obvious)");const char*targets[]={"Head","Neck","Chest"};ComboCard("Target",&aim_target,targets,3);const char*priorities[]={"Closest","Lowest HP"};ComboCard("Priority",&aim_priority,priorities,2);if(KeybindCard("kb","Aimbot Key",aim_key,wait_aim_key))wait_aim_key=true;ToggleColorCard("Show FOV",&aim_show_fov,aim_fov_col);ToggleCard("Visibility Check",&aim_visicheck,"Only aims at visible targets");ImGui::PopStyleVar();}
-            ImGui::Dummy(ImVec2(0,10));
-            ToggleCard("Magnet",&magnet_on);
-            ImGuiID mtID=ImGui::GetID("mta");float mtA=st->GetFloat(mtID,magnet_on?1.0f:0.0f),mtTt=magnet_on?1.0f:0.0f;mtA+=(mtTt-mtA)*0.20f;if(fabsf(mtTt-mtA)<0.01f)mtA=mtTt;st->SetFloat(mtID,mtA);
-            if(mtA>0.02f){ImGui::PushStyleVar(ImGuiStyleVar_Alpha,mtA);
-            SliderCard("Magnet FOV",&magnet_fov,50.0f,800.0f,"%.0f");
-            SliderCard("Distance",&magnet_distance,1.0f,15.0f,"%.1fm");
-            const char*magT2[]={"Head","Neck","Chest"};ComboCard("Magnet Target",&magnet_target,magT2,3);const char*priorities[]={"Closest","Lowest HP"};ComboCard("Priority",&magnet_priority,priorities,2);
-            if(KeybindCard("mtk","Magnet Key",magnet_key,wait_magnet_key))wait_magnet_key=true;
-            ToggleColorCard("Show FOV##M",&magnet_show_fov,magnet_fov_col);
-            ImGui::PopStyleVar();}
-            ImGui::Dummy(ImVec2(0,10));
-            ToggleCard("Pro Aim",&proaim_on,"Moves crosshair only - camera stays free");
-            ImGuiID mID=ImGui::GetID("ma");float mA=st->GetFloat(mID,proaim_on?1.0f:0.0f),mTt=proaim_on?1.0f:0.0f;mA+=(mTt-mA)*0.20f;if(fabsf(mTt-mA)<0.01f)mA=mTt;st->SetFloat(mID,mA);
-            if(mA>0.02f){ImGui::PushStyleVar(ImGuiStyleVar_Alpha,mA);
-            SliderIntCard("Pro Aim FOV",&proaim_fov,50,800,"FOV in pixels");
-            SliderCard("Stickiness",&proaim_stickiness,0.5f,0.99f,"%.2f","How fast crosshair snaps to target");
-            const char*magTargets[]={"Head","Neck","Chest"};ComboCard("Target",&proaim_target,magTargets,3);const char*priorities[]={"Closest","Lowest HP"};ComboCard("Priority",&proaim_priority,priorities,2);
-            if(KeybindCard("mk","Pro Aim Key",proaim_key,wait_proaim_key))wait_proaim_key=true;
-            ToggleColorCard("Show FOV##P",&proaim_show_fov,proaim_fov_col);
-            ImGui::PopStyleVar();}ImGui::NextColumn();
-            ImGui::Dummy(ImVec2(0,6));
-            ImGui::Columns(1);
+            // COMBAT - three independent side-by-side cards using manual cursor positioning
+            // (expansion of one does not push toggles of others; top-aligned like VISUALS)
+            ImGui::BeginChild("##combat_cards", ImVec2(cW, MH-HH-20), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+
+            ImGuiStorage* st = ImGui::GetStateStorage();
+            ImVec2 startScreenPos = ImGui::GetCursorScreenPos();
+            float gap = 8.0f;
+            float cardW = (cW - 2.0f * gap) / 3.0f;
+
+            // === LEFT: AIMBOT ===
+            ImGui::SetCursorScreenPos(startScreenPos);
+            ImGui::BeginChild("##aim_card", ImVec2(cardW, 0), false);
+            ToggleCard("Enable Aimbot", &aim_on, "Enables aimbot");
+            ImGuiID aID = ImGui::GetID("aa");
+            float aA = st->GetFloat(aID, aim_on ? 1.0f : 0.0f), aT = aim_on ? 1.0f : 0.0f;
+            aA += (aT - aA) * 0.20f; if (fabsf(aT - aA) < 0.01f) aA = aT; st->SetFloat(aID, aA);
+            if (aA > 0.02f) {
+                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, aA);
+                SliderIntCard("FOV Radius", &aim_fov_size, 10, 500, "FOV size in pixels");
+                SliderIntCard("Smoothness", &aim_smooth, 1, 20, "1 = instant (more obvious)");
+                const char* targets[] = {"Head", "Neck", "Chest"};
+                ComboCard("Target", &aim_target, targets, 3);
+                const char* priorities[] = {"Closest", "Lowest HP"};
+                ComboCard("Priority", &aim_priority, priorities, 2);
+                if (KeybindCard("kb", "Aimbot Key", aim_key, wait_aim_key)) wait_aim_key = true;
+                ToggleColorCard("Show FOV", &aim_show_fov, aim_fov_col);
+                ToggleCard("Visibility Check", &aim_visicheck, "Only aims at visible targets");
+                ImGui::PopStyleVar();
+            }
+            ImGui::EndChild();
+
+            // === MIDDLE: MAGNET ===
+            ImVec2 magStart = ImVec2(startScreenPos.x + cardW + gap, startScreenPos.y);
+            ImGui::SetCursorScreenPos(magStart);
+            ImGui::BeginChild("##mag_card", ImVec2(cardW, 0), false);
+            ToggleCard("Magnet", &magnet_on);
+            ImGuiID mtID = ImGui::GetID("mta");
+            float mtA = st->GetFloat(mtID, magnet_on ? 1.0f : 0.0f), mtTt = magnet_on ? 1.0f : 0.0f;
+            mtA += (mtTt - mtA) * 0.20f; if (fabsf(mtTt - mtA) < 0.01f) mtA = mtTt; st->SetFloat(mtID, mtA);
+            if (mtA > 0.02f) {
+                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, mtA);
+                ToggleCard("Pull ALL (no priority)", &magnet_pull_all, "Pulls every player in range (ignores priority)");
+                SliderCard("Magnet FOV", &magnet_fov, 50.0f, 800.0f, "%.0f");
+                SliderCard("Distance", &magnet_distance, 1.0f, 15.0f, "%.1fm");
+                const char* magT2[] = {"Head", "Neck", "Chest"};
+                ComboCard("Magnet Target", &magnet_target, magT2, 3);
+                if (!magnet_pull_all) {
+                    const char* priorities[] = {"Closest", "Lowest HP"};
+                    ComboCard("Priority", &magnet_priority, priorities, 2);
+                }
+                if (KeybindCard("mtk", "Magnet Key", magnet_key, wait_magnet_key)) wait_magnet_key = true;
+                ToggleColorCard("Show FOV##M", &magnet_show_fov, magnet_fov_col);
+                ImGui::PopStyleVar();
+            }
+            ImGui::EndChild();
+
+            // === RIGHT: PRO AIM ===
+            ImVec2 proStart = ImVec2(magStart.x + cardW + gap, startScreenPos.y);
+            ImGui::SetCursorScreenPos(proStart);
+            ImGui::BeginChild("##pro_card", ImVec2(cardW, 0), false);
+            ToggleCard("Pro Aim", &proaim_on, "Moves crosshair only - camera stays free");
+            ImGuiID mID = ImGui::GetID("ma");
+            float mA = st->GetFloat(mID, proaim_on ? 1.0f : 0.0f), mTt = proaim_on ? 1.0f : 0.0f;
+            mA += (mTt - mA) * 0.20f; if (fabsf(mTt - mA) < 0.01f) mA = mTt; st->SetFloat(mID, mA);
+            if (mA > 0.02f) {
+                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, mA);
+                SliderIntCard("Pro Aim FOV", &proaim_fov, 50, 800, "FOV in pixels");
+                SliderCard("Stickiness", &proaim_stickiness, 0.5f, 0.99f, "%.2f", "How fast crosshair snaps to target");
+                const char* magTargets[] = {"Head", "Neck", "Chest"};
+                ComboCard("Target", &proaim_target, magTargets, 3);
+                const char* priorities[] = {"Closest", "Lowest HP"};
+                ComboCard("Priority", &proaim_priority, priorities, 2);
+                if (KeybindCard("mk", "Pro Aim Key", proaim_key, wait_proaim_key)) wait_proaim_key = true;
+                ToggleColorCard("Show FOV##P", &proaim_show_fov, proaim_fov_col);
+                ImGui::PopStyleVar();
+            }
+            ImGui::EndChild();
+
+            ImGui::EndChild(); // ##combat_cards
         }break;
         case 1:{
             ImGui::BeginChild("##vscroll",ImVec2(cW,MH-HH-20),false,ImGuiWindowFlags_AlwaysVerticalScrollbar);
-            ImGui::Columns(2,"##vc",false);ImGui::SetColumnWidth(0,colW+6);
-            ImDrawList*dP=ImGui::GetWindowDrawList();dP->AddText(ImGui::GetCursorScreenPos(),COL_TEXT_DIM,"PLAYER ESP");ImGui::Dummy(ImVec2(0,18));
-            ToggleCard("Player ESP",&esp_p);
-            ImGuiID eID=ImGui::GetID("ea");ImGuiStorage*st=ImGui::GetStateStorage();float eA=st->GetFloat(eID,esp_p?1.0f:0.0f),eT=esp_p?1.0f:0.0f;eA+=(eT-eA)*0.20f;if(fabsf(eT-eA)<0.01f)eA=eT;st->SetFloat(eID,eA);
-            if(eA>0.02f){ImGui::PushStyleVar(ImGuiStyleVar_Alpha,eA);ImGui::Columns(2,"##esp_p",false);ToggleColorCard("Box",&esp_p_box,esp_p_box_col);ToggleColorCard("Name",&esp_p_name,esp_p_name_col);ToggleColorCard("Health",&esp_p_hp,esp_p_hp_col);ToggleColorCard("Distance",&esp_p_dist,esp_p_dist_col);ToggleColorCard("Weapon",&esp_p_weapon,esp_p_weapon_col);ToggleColorCard("Lines",&esp_p_lines,esp_p_lines_col);ToggleColorCard("Skeleton",&esp_p_skeleton,esp_p_skel_col);ImGui::Columns(1);ImGui::Dummy(ImVec2(0,10));dP->AddText(ImGui::GetCursorScreenPos(),COL_TEXT_DIM,"CONFIG");ImGui::Dummy(ImVec2(0,18));ToggleCard("Filled Box",&esp_p_box_fill);ToggleCard("Dynamic Color (HP)",&esp_p_hp_dynamic);ImGui::PopStyleVar();}
-            
-            ImGui::NextColumn();
-            ImDrawList*dA=ImGui::GetWindowDrawList();dA->AddText(ImGui::GetCursorScreenPos(),COL_TEXT_DIM,"ADMIN ESP");ImGui::Dummy(ImVec2(0,18));
-            ToggleCard("Admin ESP",&esp_admin);
-            ImGuiID adID=ImGui::GetID("ada");float adA=st->GetFloat(adID,esp_admin?1.0f:0.0f),adT=esp_admin?1.0f:0.0f;adA+=(adT-adA)*0.20f;if(fabsf(adT-adA)<0.01f)adA=adT;st->SetFloat(adID,adA);
-            if(adA>0.02f){ImGui::PushStyleVar(ImGuiStyleVar_Alpha,adA);ImGui::Columns(2,"##esp_a",false);ToggleCard("Box##ADM",&esp_admin_box);ToggleCard("Name##ADM",&esp_admin_name);ToggleCard("Distance##ADM",&esp_admin_dist);ToggleCard("Health##ADM",&esp_admin_hp);ToggleCard("Lines##ADM",&esp_admin_lines);ToggleCard("Skeleton##ADM",&esp_admin_skeleton);ImGui::Columns(1);ImGui::Dummy(ImVec2(0,10));dA->AddText(ImGui::GetCursorScreenPos(),COL_TEXT_DIM,"CONFIG");ImGui::Dummy(ImVec2(0,18));ToggleCard("Filled Box##ADM",&esp_admin_box_fill);ToggleCard("Side Alert",&esp_admin_popup);ImGui::PopStyleVar();}
-            ImGui::Columns(1);ImGui::EndChild();
+
+            float leftW = colW + 6;
+            float rightW = cW - leftW - 12;
+
+            // Record the exact starting screen position
+            ImVec2 startScreenPos = ImGui::GetCursorScreenPos();
+
+            // === LEFT COLUMN: PLAYER ESP ===
+            ImGui::SetCursorScreenPos(startScreenPos);
+            ImGui::BeginChild("##esp_left", ImVec2(leftW, 0), false);
+            ImDrawList* dP = ImGui::GetWindowDrawList();
+            dP->AddText(ImGui::GetCursorScreenPos(), COL_TEXT_DIM, "PLAYER ESP");
+            ImGui::Dummy(ImVec2(0, 18));
+
+            ToggleCard("Player ESP", &esp_p);
+            ImGuiID eID = ImGui::GetID("ea");
+            ImGuiStorage* st = ImGui::GetStateStorage();
+            float eA = st->GetFloat(eID, esp_p ? 1.0f : 0.0f), eT = esp_p ? 1.0f : 0.0f;
+            eA += (eT - eA) * 0.20f; if (fabsf(eT - eA) < 0.01f) eA = eT; st->SetFloat(eID, eA);
+
+            if (eA > 0.02f) {
+                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, eA);
+                ToggleColorCard("Box", &esp_p_box, esp_p_box_col);
+                ToggleColorCard("Name", &esp_p_name, esp_p_name_col);
+                ToggleColorCard("Health", &esp_p_hp, esp_p_hp_col);
+                ToggleColorCard("Distance", &esp_p_dist, esp_p_dist_col);
+                ToggleColorCard("Weapon", &esp_p_weapon, esp_p_weapon_col);
+                ToggleColorCard("Lines", &esp_p_lines, esp_p_lines_col);
+                ToggleColorCard("Skeleton", &esp_p_skeleton, esp_p_skel_col);
+                ImGui::Dummy(ImVec2(0, 10));
+                dP->AddText(ImGui::GetCursorScreenPos(), COL_TEXT_DIM, "CONFIG");
+                ImGui::Dummy(ImVec2(0, 18));
+                ToggleCard("Filled Box", &esp_p_box_fill);
+                ToggleCard("Dynamic Color (HP)", &esp_p_hp_dynamic);
+                ImGui::PopStyleVar();
+            }
+            ImGui::EndChild();
+
+            // === RIGHT COLUMN: ADMIN ESP (always starts at the exact same Y) ===
+            ImVec2 rightStart = ImVec2(startScreenPos.x + leftW + 12, startScreenPos.y);
+            ImGui::SetCursorScreenPos(rightStart);
+            ImGui::BeginChild("##esp_right", ImVec2(rightW, 0), false);
+            ImDrawList* dA = ImGui::GetWindowDrawList();
+            dA->AddText(ImGui::GetCursorScreenPos(), COL_TEXT_DIM, "ADMIN ESP");
+            ImGui::Dummy(ImVec2(0, 18));
+
+            ToggleCard("Admin ESP", &esp_admin);
+            ImGuiID adID = ImGui::GetID("ada");
+            float adA = st->GetFloat(adID, esp_admin ? 1.0f : 0.0f), adT = esp_admin ? 1.0f : 0.0f;
+            adA += (adT - adA) * 0.20f; if (fabsf(adT - adA) < 0.01f) adA = adT; st->SetFloat(adID, adA);
+
+            if (adA > 0.02f) {
+                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, adA);
+                ToggleCard("Box##ADM", &esp_admin_box);
+                ToggleCard("Name##ADM", &esp_admin_name);
+                ToggleCard("Distance##ADM", &esp_admin_dist);
+                ToggleCard("Health##ADM", &esp_admin_hp);
+                ToggleCard("Lines##ADM", &esp_admin_lines);
+                ToggleCard("Skeleton##ADM", &esp_admin_skeleton);
+                ImGui::Dummy(ImVec2(0, 10));
+                dA->AddText(ImGui::GetCursorScreenPos(), COL_TEXT_DIM, "CONFIG");
+                ImGui::Dummy(ImVec2(0, 18));
+                ToggleCard("Filled Box##ADM", &esp_admin_box_fill);
+                ToggleCard("Side Alert", &esp_admin_popup);
+                ImGui::PopStyleVar();
+            }
+            ImGui::EndChild();
+
+            ImGui::EndChild(); // end vscroll
         }break;
         case 2:{
             ImDrawList*dtp=ImGui::GetWindowDrawList();
@@ -1652,6 +1704,13 @@ void RenderMenu(LPDIRECT3DDEVICE9 pDevice){
             if(fabsf(ssT-ssA)<0.01f) ssA=ssT;
             ss_st->SetFloat(ssID,ssA);
             if(ssA>0.02f){ImGui::PushStyleVar(ImGuiStyleVar_Alpha,ssA);if(KeybindCard("ssk","Sling Shot Key",slingshot_key,wait_slingshot_key,"Press to launch vehicle forward")){wait_slingshot_key=true;}SliderCard("Speed (km/h)",&slingshot_speed,10.0f,300.0f,"%.0f");ImGui::PopStyleVar();}
+            ImGui::Dummy(ImVec2(0,6));
+            dtp->AddText(ImGui::GetCursorScreenPos(),COL_TEXT_DIM,"INSTA BRAKE");
+            ImGui::Dummy(ImVec2(0,14));
+            ToggleCard("Insta Brake",&insta_brake_on,"Stops the vehicle instantly when key pressed");
+            ImGuiID ibID=ImGui::GetID("iba");
+            float ibA=st->GetFloat(ibID,insta_brake_on?1.0f:0.0f),ibT=insta_brake_on?1.0f:0.0f;ibA+=(ibT-ibA)*0.20f;if(fabsf(ibT-ibA)<0.01f)ibA=ibT;st->SetFloat(ibID,ibA);
+            if(ibA>0.02f){ImGui::PushStyleVar(ImGuiStyleVar_Alpha,ibA);if(KeybindCard("ibk","Insta Brake Key",insta_brake_key,wait_insta_brake_key,"Press to instantly brake the vehicle"))wait_insta_brake_key=true;ImGui::PopStyleVar();}
             ImGui::Dummy(ImVec2(0,6));
             dtp->AddText(ImGui::GetCursorScreenPos(),COL_TEXT_DIM,"VEHICLE ESP");ImGui::Dummy(ImVec2(0,14));
             ToggleCard("Vehicle ESP",&esp_v);
@@ -1737,6 +1796,12 @@ void RenderMenu(LPDIRECT3DDEVICE9 pDevice){
                 if(KeybindCard("fk","Fly Key",fly_key,wait_fly_key))wait_fly_key=true;
                 SliderCard("Fly Speed",&fly_speed,0.5f,10.0f,"%.1f");
             }
+            ToggleCard("Noclip", &noclip_on, "Atravessa paredes (no clip) - personagem anda normalmente");
+            if (noclip_on) {
+                // Movimento 100% normal (WASD, pulo, corrida). Apenas paredes perdem colisão.
+                ImGui::TextColored(ImVec4(0.55f, 0.55f, 0.7f, 1.0f), "Movimento normal do GTA (sem override)");
+                ImGui::Dummy(ImVec2(0, 2));
+            }
             ToggleCard("Local Player ESP",&esp_l);
             ImGuiID lID=ImGui::GetID("la");
             ImGuiStorage*st=ImGui::GetStateStorage();
@@ -1760,7 +1825,7 @@ void RenderMenu(LPDIRECT3DDEVICE9 pDevice){
                 ImGui::PopStyleVar();
             }
 			
-			ToggleCard("Super Punch (RPC Sync)",&superpunch_on);
+
             ImGui::Columns(1);
         }break;
         case 4:{
